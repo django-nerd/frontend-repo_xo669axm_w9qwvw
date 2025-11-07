@@ -9,6 +9,12 @@ function rateFromSemitones(semi) {
 
 export default function VoiceControls({ onMessage, onTalkingChange }) {
   const mediaRecorderRef = useRef(null);
+  const streamRef = useRef(null);
+  const audioContextRef = useRef(null);
+  const analyserRef = useRef(null);
+  const rafRef = useRef(null);
+  const lastTalkStateRef = useRef(false);
+
   const [isRecording, setIsRecording] = useState(false);
   const [audioUrl, setAudioUrl] = useState('');
   const audioRef = useRef(null);
@@ -22,9 +28,56 @@ export default function VoiceControls({ onMessage, onTalkingChange }) {
     }
   }, [pitch]);
 
+  // Volume-driven lip-sync during recording
+  const startLevelMonitor = () => {
+    try {
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      audioContextRef.current = audioContext;
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 2048;
+      analyserRef.current = analyser;
+      const source = audioContext.createMediaStreamSource(streamRef.current);
+      source.connect(analyser);
+      const data = new Uint8Array(analyser.frequencyBinCount);
+
+      const loop = () => {
+        analyser.getByteTimeDomainData(data);
+        // Compute RMS in time domain
+        let sum = 0;
+        for (let i = 0; i < data.length; i++) {
+          const v = (data[i] - 128) / 128; // -1..1
+          sum += v * v;
+        }
+        const rms = Math.sqrt(sum / data.length);
+        const talking = rms > 0.06; // threshold tuned for voice
+        if (talking !== lastTalkStateRef.current) {
+          lastTalkStateRef.current = talking;
+          onTalkingChange?.(talking);
+        }
+        rafRef.current = requestAnimationFrame(loop);
+      };
+      loop();
+    } catch {
+      // Fallback: simple talking state on/off
+      onTalkingChange?.(true);
+    }
+  };
+
+  const stopLevelMonitor = async () => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    rafRef.current = null;
+    if (audioContextRef.current) {
+      try { await audioContextRef.current.close(); } catch {}
+      audioContextRef.current = null;
+    }
+    lastTalkStateRef.current = false;
+    onTalkingChange?.(false);
+  };
+
   const startRecording = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
       const recorder = new MediaRecorder(stream);
       mediaRecorderRef.current = recorder;
       const chunks = [];
@@ -42,30 +95,29 @@ export default function VoiceControls({ onMessage, onTalkingChange }) {
             rec.onresult = (ev) => {
               const text = ev.results[0][0].transcript;
               onMessage?.({ from: 'you', text });
-              // Cat responds playfully
               const replies = [
                 "Mreow! Did you just say '" + text + "'? I'm on it!",
                 "Purr-fect words! I will repeat: '" + text + "'",
-                "Nya! That sounded fun. Let's echo it!",
+                'Nya! That sounded fun. Let\'s echo it!',
               ];
               onMessage?.({ from: 'cat', text: replies[Math.floor(Math.random()*replies.length)] });
             };
             rec.onerror = () => {
               onMessage?.({ from: 'you', text: '...' });
-              onMessage?.({ from: 'cat', text: "I heard you! Hit play to hear my remix." });
+              onMessage?.({ from: 'cat', text: 'I heard you! Hit play to hear my remix.' });
             };
             rec.start();
           } else {
-            onMessage?.({ from: 'cat', text: "I heard you! Hit play to hear my remix." });
+            onMessage?.({ from: 'cat', text: 'I heard you! Hit play to hear my remix.' });
           }
         } catch {
-          onMessage?.({ from: 'cat', text: "I heard you! Hit play to hear my remix." });
+          onMessage?.({ from: 'cat', text: 'I heard you! Hit play to hear my remix.' });
         }
       };
       recorder.start();
       setIsRecording(true);
       setHint('Listening...');
-      onTalkingChange?.(true);
+      startLevelMonitor();
     } catch (err) {
       setHint('Microphone permission is required.');
     }
@@ -76,10 +128,13 @@ export default function VoiceControls({ onMessage, onTalkingChange }) {
     if (mediaRecorderRef.current.state !== 'inactive') {
       mediaRecorderRef.current.stop();
     }
-    mediaRecorderRef.current.stream.getTracks().forEach(t => t.stop());
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
     setIsRecording(false);
     setHint('Great! Now press play.');
-    onTalkingChange?.(false);
+    stopLevelMonitor();
   };
 
   const togglePlay = async () => {
