@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Circle, Square, Play, Pause, Volume2 } from 'lucide-react';
 
-// Simple pitch mapping: semitones -> playbackRate
+// Map semitones (–12..+12) to playbackRate (~0.6..1.8)
 function rateFromSemitones(semi) {
   const clamped = Math.max(-12, Math.min(12, semi));
   return Math.min(1.8, Math.max(0.6, Math.pow(2, clamped / 12)));
@@ -10,10 +10,11 @@ function rateFromSemitones(semi) {
 export default function VoiceControls({ onMessage, onTalkingChange }) {
   const mediaRecorderRef = useRef(null);
   const streamRef = useRef(null);
+
+  // Only used during recording for lip-sync
   const audioContextRef = useRef(null);
   const analyserRef = useRef(null);
   const rafRef = useRef(null);
-  const lastTalkStateRef = useRef(false);
 
   const [isRecording, setIsRecording] = useState(false);
   const [audioUrl, setAudioUrl] = useState('');
@@ -28,19 +29,18 @@ export default function VoiceControls({ onMessage, onTalkingChange }) {
     }
   }, [pitch]);
 
-  // Shared monitor for either mic input or playback element
-  const startLevelMonitor = (sourceNodeFactory) => {
-    stopLevelMonitor();
+  const startMicMonitor = (stream) => {
+    stopMicMonitor();
     try {
-      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-      audioContextRef.current = audioContext;
-      const analyser = audioContext.createAnalyser();
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      const ctx = new AudioCtx();
+      const analyser = ctx.createAnalyser();
       analyser.fftSize = 2048;
-      analyserRef.current = analyser;
-
-      const source = sourceNodeFactory(audioContext);
-      if (!source) throw new Error('No source');
+      const source = ctx.createMediaStreamSource(stream);
       source.connect(analyser);
+
+      audioContextRef.current = ctx;
+      analyserRef.current = analyser;
 
       const data = new Uint8Array(analyser.frequencyBinCount);
       const loop = () => {
@@ -51,20 +51,17 @@ export default function VoiceControls({ onMessage, onTalkingChange }) {
           sum += v * v;
         }
         const rms = Math.sqrt(sum / data.length);
-        const talking = rms > 0.05; // threshold tuned for voice/music
-        if (talking !== lastTalkStateRef.current) {
-          lastTalkStateRef.current = talking;
-          onTalkingChange?.(talking);
-        }
+        onTalkingChange?.(rms > 0.05);
         rafRef.current = requestAnimationFrame(loop);
       };
       loop();
-    } catch {
+    } catch (e) {
+      // Fallback: show mouth open while recording
       onTalkingChange?.(true);
     }
   };
 
-  const stopLevelMonitor = async () => {
+  const stopMicMonitor = async () => {
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
     rafRef.current = null;
     if (audioContextRef.current) {
@@ -72,7 +69,6 @@ export default function VoiceControls({ onMessage, onTalkingChange }) {
       audioContextRef.current = null;
     }
     analyserRef.current = null;
-    lastTalkStateRef.current = false;
     onTalkingChange?.(false);
   };
 
@@ -83,11 +79,17 @@ export default function VoiceControls({ onMessage, onTalkingChange }) {
       const recorder = new MediaRecorder(stream);
       mediaRecorderRef.current = recorder;
       const chunks = [];
-      recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunks.push(e.data);
+      };
+
       recorder.onstop = async () => {
         const blob = new Blob(chunks, { type: 'audio/webm' });
         const url = URL.createObjectURL(blob);
         setAudioUrl(url);
+
+        // Simple speech-recognition attempt (best-effort)
         try {
           const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
           if (SR) {
@@ -99,9 +101,9 @@ export default function VoiceControls({ onMessage, onTalkingChange }) {
               const replies = [
                 "Mreow! Did you just say '" + text + "'? I'm on it!",
                 "Purr-fect words! I will repeat: '" + text + "'",
-                "Nya! That sounded fun. Let's echo it!",
+                'Nya! That sounded fun. Let\'s echo it!',
               ];
-              onMessage?.({ from: 'cat', text: replies[Math.floor(Math.random()*replies.length)] });
+              onMessage?.({ from: 'cat', text: replies[Math.floor(Math.random() * replies.length)] });
             };
             rec.onerror = () => {
               onMessage?.({ from: 'you', text: '...' });
@@ -115,10 +117,11 @@ export default function VoiceControls({ onMessage, onTalkingChange }) {
           onMessage?.({ from: 'cat', text: 'I heard you! Hit play to hear my remix.' });
         }
       };
+
       recorder.start();
       setIsRecording(true);
       setHint('Listening...');
-      startLevelMonitor((ctx) => ctx.createMediaStreamSource(streamRef.current));
+      startMicMonitor(stream);
     } catch (err) {
       setHint('Microphone permission is required.');
     }
@@ -135,7 +138,7 @@ export default function VoiceControls({ onMessage, onTalkingChange }) {
     }
     setIsRecording(false);
     setHint('Great! Now press play.');
-    stopLevelMonitor();
+    stopMicMonitor();
   };
 
   const togglePlay = async () => {
@@ -143,30 +146,29 @@ export default function VoiceControls({ onMessage, onTalkingChange }) {
     if (isPlaying) {
       audioRef.current.pause();
       setIsPlaying(false);
-      stopLevelMonitor();
+      // No lip-sync during playback in this version
+      onTalkingChange?.(false);
     } else {
       try {
         await audioRef.current.play();
         setIsPlaying(true);
-        // Create a media element source and monitor it
-        startLevelMonitor((ctx) => ctx.createMediaElementSource(audioRef.current));
       } catch {}
     }
   };
 
-  // Ensure talk state resets when audio ends
+  // Reset state when audio ends/pauses
   useEffect(() => {
     const el = audioRef.current;
     if (!el) return;
-    const onEnded = () => { setIsPlaying(false); stopLevelMonitor(); };
-    const onPause = () => { setIsPlaying(false); stopLevelMonitor(); };
+    const onEnded = () => { setIsPlaying(false); onTalkingChange?.(false); };
+    const onPause = () => { setIsPlaying(false); onTalkingChange?.(false); };
     el.addEventListener('ended', onEnded);
     el.addEventListener('pause', onPause);
     return () => {
       el.removeEventListener('ended', onEnded);
       el.removeEventListener('pause', onPause);
     };
-  }, []);
+  }, [onTalkingChange]);
 
   return (
     <div className="w-full max-w-xl mx-auto p-4 rounded-2xl border border-neutral-200 bg-white/80 backdrop-blur space-y-4">
@@ -185,7 +187,7 @@ export default function VoiceControls({ onMessage, onTalkingChange }) {
               <Square size={16} /> Stop
             </button>
           )}
-          <button onClick={togglePlay} disabled={!audioUrl} className="inline-flex items-center gap-2 px-4 py-2 rounded-full border border-neutral-300 hover:bg-neutral-50 transition disabled:opacity-50 disabled:cursor-not-allowed">
+          <button onClick={togglePlay} className="inline-flex items-center gap-2 px-4 py-2 rounded-full border border-neutral-300 hover:bg-neutral-50 transition">
             {isPlaying ? <Pause size={16} /> : <Play size={16} />} Play
           </button>
         </div>
