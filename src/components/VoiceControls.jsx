@@ -11,9 +11,11 @@ export default function VoiceControls({ onMessage, onTalkingChange }) {
   const mediaRecorderRef = useRef(null);
   const streamRef = useRef(null);
 
-  // Only used during recording for lip-sync
+  // Unified context/analyser used for both mic monitoring and playback lip-sync
   const audioContextRef = useRef(null);
   const analyserRef = useRef(null);
+  const micSourceRef = useRef(null);
+  const playbackSourceRef = useRef(null);
   const rafRef = useRef(null);
 
   const [isRecording, setIsRecording] = useState(false);
@@ -29,47 +31,115 @@ export default function VoiceControls({ onMessage, onTalkingChange }) {
     }
   }, [pitch]);
 
-  const startMicMonitor = (stream) => {
-    stopMicMonitor();
+  const ensureAudioGraph = () => {
+    if (audioContextRef.current && analyserRef.current) return;
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    const ctx = new AudioCtx();
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 2048;
+    audioContextRef.current = ctx;
+    analyserRef.current = analyser;
+  };
+
+  const startLevelLoop = () => {
+    if (!analyserRef.current) return;
+    const analyser = analyserRef.current;
+    const data = new Uint8Array(analyser.fftSize);
+    const loop = () => {
+      analyser.getByteTimeDomainData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) {
+        const v = (data[i] - 128) / 128; // -1..1
+        sum += v * v;
+      }
+      const rms = Math.sqrt(sum / data.length);
+      onTalkingChange?.(rms > 0.05);
+      rafRef.current = requestAnimationFrame(loop);
+    };
+    rafRef.current = requestAnimationFrame(loop);
+  };
+
+  const stopLevelLoop = async () => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    rafRef.current = null;
+    onTalkingChange?.(false);
+  };
+
+  const cleanupAudioGraph = async () => {
     try {
-      const AudioCtx = window.AudioContext || window.webkitAudioContext;
-      const ctx = new AudioCtx();
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 2048;
+      if (micSourceRef.current) {
+        try { micSourceRef.current.disconnect(); } catch {}
+        micSourceRef.current = null;
+      }
+      if (playbackSourceRef.current) {
+        try { playbackSourceRef.current.disconnect(); } catch {}
+        playbackSourceRef.current = null;
+      }
+      if (analyserRef.current) {
+        try { analyserRef.current.disconnect(); } catch {}
+      }
+      if (audioContextRef.current) {
+        try { await audioContextRef.current.close(); } catch {}
+      }
+    } finally {
+      analyserRef.current = null;
+      audioContextRef.current = null;
+    }
+  };
+
+  // Mic monitoring for recording
+  const startMicMonitor = (stream) => {
+    stopLevelLoop();
+    ensureAudioGraph();
+    try {
+      const ctx = audioContextRef.current;
+      const analyser = analyserRef.current;
       const source = ctx.createMediaStreamSource(stream);
+      micSourceRef.current = source;
       source.connect(analyser);
-
-      audioContextRef.current = ctx;
-      analyserRef.current = analyser;
-
-      const data = new Uint8Array(analyser.frequencyBinCount);
-      const loop = () => {
-        analyser.getByteTimeDomainData(data);
-        let sum = 0;
-        for (let i = 0; i < data.length; i++) {
-          const v = (data[i] - 128) / 128; // -1..1
-          sum += v * v;
-        }
-        const rms = Math.sqrt(sum / data.length);
-        onTalkingChange?.(rms > 0.05);
-        rafRef.current = requestAnimationFrame(loop);
-      };
-      loop();
+      startLevelLoop();
     } catch (e) {
-      // Fallback: show mouth open while recording
       onTalkingChange?.(true);
     }
   };
 
   const stopMicMonitor = async () => {
-    if (rafRef.current) cancelAnimationFrame(rafRef.current);
-    rafRef.current = null;
-    if (audioContextRef.current) {
-      try { await audioContextRef.current.close(); } catch {}
-      audioContextRef.current = null;
+    await stopLevelLoop();
+    // Do not tear down entire graph here; playback may start soon
+    if (micSourceRef.current) {
+      try { micSourceRef.current.disconnect(); } catch {}
+      micSourceRef.current = null;
     }
-    analyserRef.current = null;
-    onTalkingChange?.(false);
+  };
+
+  // Playback lip-sync setup
+  const startPlaybackMonitor = () => {
+    stopLevelLoop();
+    ensureAudioGraph();
+    try {
+      const ctx = audioContextRef.current;
+      const analyser = analyserRef.current;
+      if (playbackSourceRef.current) {
+        try { playbackSourceRef.current.disconnect(); } catch {}
+      }
+      const source = ctx.createMediaElementSource(audioRef.current);
+      playbackSourceRef.current = source;
+      source.connect(analyser);
+      // Also ensure audio actually reaches speakers
+      analyser.connect(ctx.destination);
+      startLevelLoop();
+    } catch (e) {
+      // Fallback: keep mouth closed if analyser fails
+      onTalkingChange?.(false);
+    }
+  };
+
+  const stopPlaybackMonitor = async () => {
+    await stopLevelLoop();
+    if (playbackSourceRef.current) {
+      try { playbackSourceRef.current.disconnect(); } catch {}
+      playbackSourceRef.current = null;
+    }
   };
 
   const startRecording = async () => {
@@ -89,7 +159,7 @@ export default function VoiceControls({ onMessage, onTalkingChange }) {
         const url = URL.createObjectURL(blob);
         setAudioUrl(url);
 
-        // Simple speech-recognition attempt (best-effort)
+        // Best-effort speech recognition for fun text replies
         try {
           const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
           if (SR) {
@@ -101,7 +171,7 @@ export default function VoiceControls({ onMessage, onTalkingChange }) {
               const replies = [
                 "Mreow! Did you just say '" + text + "'? I'm on it!",
                 "Purr-fect words! I will repeat: '" + text + "'",
-                'Nya! That sounded fun. Let\'s echo it!',
+                "Nya! That sounded fun. Let's echo it!",
               ];
               onMessage?.({ from: 'cat', text: replies[Math.floor(Math.random() * replies.length)] });
             };
@@ -142,33 +212,45 @@ export default function VoiceControls({ onMessage, onTalkingChange }) {
   };
 
   const togglePlay = async () => {
-    if (!audioRef.current) return;
+    if (!audioRef.current || !audioUrl) return;
     if (isPlaying) {
       audioRef.current.pause();
       setIsPlaying(false);
-      // No lip-sync during playback in this version
-      onTalkingChange?.(false);
+      await stopPlaybackMonitor();
     } else {
       try {
+        // Some browsers require resume on user gesture
+        if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
+          try { await audioContextRef.current.resume(); } catch {}
+        }
+        startPlaybackMonitor();
         await audioRef.current.play();
         setIsPlaying(true);
       } catch {}
     }
   };
 
-  // Reset state when audio ends/pauses
+  // Reset and cleanup when audio element ends/pauses
   useEffect(() => {
     const el = audioRef.current;
     if (!el) return;
-    const onEnded = () => { setIsPlaying(false); onTalkingChange?.(false); };
-    const onPause = () => { setIsPlaying(false); onTalkingChange?.(false); };
+    const onEnded = async () => { setIsPlaying(false); await stopPlaybackMonitor(); };
+    const onPause = async () => { setIsPlaying(false); await stopPlaybackMonitor(); };
     el.addEventListener('ended', onEnded);
     el.addEventListener('pause', onPause);
     return () => {
       el.removeEventListener('ended', onEnded);
       el.removeEventListener('pause', onPause);
     };
-  }, [onTalkingChange]);
+  }, []);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      stopLevelLoop();
+      cleanupAudioGraph();
+    };
+  }, []);
 
   return (
     <div className="w-full max-w-xl mx-auto p-4 rounded-2xl border border-neutral-200 bg-white/80 backdrop-blur space-y-4">
@@ -187,7 +269,11 @@ export default function VoiceControls({ onMessage, onTalkingChange }) {
               <Square size={16} /> Stop
             </button>
           )}
-          <button onClick={togglePlay} className="inline-flex items-center gap-2 px-4 py-2 rounded-full border border-neutral-300 hover:bg-neutral-50 transition">
+          <button
+            onClick={togglePlay}
+            disabled={!audioUrl}
+            className={`inline-flex items-center gap-2 px-4 py-2 rounded-full border border-neutral-300 transition ${!audioUrl ? 'opacity-50 cursor-not-allowed' : 'hover:bg-neutral-50'}`}
+          >
             {isPlaying ? <Pause size={16} /> : <Play size={16} />} Play
           </button>
         </div>
